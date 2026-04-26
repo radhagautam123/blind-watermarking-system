@@ -1,0 +1,16 @@
+blind-watermarking-project/watermark_project/DIV2K_train_HR/
+*.zip
+__pycache__/
+weights/
+DIV2K_train_HR/
+weights/
+__pycache__/
+__pycache__/
+*.pyccheckpoints/
+__pycache__/
+*.pth
+checkpoints/
+*.pth
+checkpoints/
+*.pth
+__pycache__/

@@ -1,0 +1,12 @@
+numpy
+opencv-python
+pillow
+matplotlib
+scikit-image
+pywavelets
+streamlit
+torch
+torchvision
+torchaudio
+jupyter
+notebook
