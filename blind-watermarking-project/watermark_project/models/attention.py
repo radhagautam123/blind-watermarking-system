@@ -7,7 +7,7 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(in_channels, in_channels // reduction),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Linear(in_channels // reduction, in_channels),
             nn.Sigmoid()
         )
@@ -27,6 +27,6 @@ class SpatialAttention(nn.Module):
     def forward(self, x):
         avg = torch.mean(x, dim=1, keepdim=True)
         mx, _ = torch.max(x, dim=1, keepdim=True)
-        x_cat = torch.cat([avg, mx], dim=1)
-        attn = torch.sigmoid(self.conv(x_cat))
+        x = torch.cat([avg, mx], dim=1)
+        attn = torch.sigmoid(self.conv(x))
         return x * attn
