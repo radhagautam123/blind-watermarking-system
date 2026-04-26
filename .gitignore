@@ -1,16 +1,18 @@
-blind-watermarking-project/watermark_project/DIV2K_train_HR/
-*.zip
-__pycache__/
-weights/
+# ================= DATA =================
 DIV2K_train_HR/
+blind-watermarking-project/watermark_project/DIV2K_train_HR/
+
+# ================= MODELS / WEIGHTS =================
 weights/
-__pycache__/
-__pycache__/
-*.pyccheckpoints/
-__pycache__/
-*.pth
 checkpoints/
 *.pth
-checkpoints/
-*.pth
+
+# ================= PYTHON =================
 __pycache__/
+*.pyc
+
+# ================= ENV =================
+venv/
+
+# ================= SYSTEM FILES =================
+.DS_Store

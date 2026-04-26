@@ -1,161 +1,169 @@
-from pathlib import Path
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
 import os
-import torch.nn.functional as F
-import torchvision.models as models
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+from torchvision import datasets, transforms
+from tqdm import tqdm
 
 from models.encoder import EncoderNet
 from models.decoder import DecoderNet
 from models.losses import image_loss, watermark_loss
 from models.attack_layer import random_attack
+from utils.security import secure_encode, secure_decode
+
 
 # ================= CONFIG =================
-IMAGE_SIZE = 256
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH_SIZE = 8
-EPOCHS = 100
+EPOCHS = 15
+LR = 1e-4
 
-DATASET_PATH = '/content/drive/MyDrive/DIV2K_train_HR'
-WEIGHTS_DIR = '/content/drive/MyDrive/watermark_project/weights'
-CHECKPOINT_PATH = '/content/drive/MyDrive/watermark_project/checkpoints/latest.pth'
+EMBED_STRENGTH = 0.05
+KEY = "secure_train_key"
 
-# ================= DATASET =================
-class DIV2KDataset(Dataset):
-    def __init__(self, root):
-        self.files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith('.png')]
-        self.transform = transforms.Compose([
-            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-            transforms.ToTensor()
-        ])
+CHECKPOINT_DIR = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    def __len__(self):
-        return len(self.files)
+# ================= DATA =================
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor()
+])
 
-    def __getitem__(self, idx):
-        img = Image.open(self.files[idx]).convert('RGB')
-        return self.transform(img)
+dataset = datasets.ImageFolder("data", transform=transform)
 
-# ================= PERCEPTUAL LOSS =================
-class PerceptualLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        vgg = models.vgg16(pretrained=True).features[:16]
-        for p in vgg.parameters():
-            p.requires_grad = False
-        self.vgg = vgg.eval()
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=0   # CPU safe
+)
 
-    def forward(self, x, y):
-        return F.mse_loss(self.vgg(x), self.vgg(y))
+# ================= MODELS =================
+encoder = EncoderNet().to(DEVICE)
+decoder = DecoderNet().to(DEVICE)
 
-# ================= LOAD CHECKPOINT =================
-def load_checkpoint(encoder, decoder, optimizer, scheduler):
-    if not os.path.exists(CHECKPOINT_PATH):
-        print("No checkpoint found.")
-        return 0, float('inf')
+optimizer = optim.Adam(
+    list(encoder.parameters()) + list(decoder.parameters()),
+    lr=LR
+)
 
-    checkpoint = torch.load(CHECKPOINT_PATH)
+# ================= RESUME =================
+start_epoch = 0
+ckpt_path = os.path.join(CHECKPOINT_DIR, "latest.pth")
 
-    encoder.load_state_dict(checkpoint['encoder_state'])
-    decoder.load_state_dict(checkpoint['decoder_state'])
-    optimizer.load_state_dict(checkpoint['optimizer_state'])
-    scheduler.load_state_dict(checkpoint['scheduler_state'])
+if os.path.exists(ckpt_path):
+    print("🔄 Resuming training...")
+    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    encoder.load_state_dict(ckpt["encoder"])
+    decoder.load_state_dict(ckpt["decoder"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    start_epoch = ckpt["epoch"] + 1
 
-    print("Checkpoint loaded.")
-    return checkpoint['epoch'] + 1, checkpoint.get('best_loss', float('inf'))
 
 # ================= TRAIN =================
-def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print("Using:", device)
+for epoch in range(start_epoch, EPOCHS):
 
-    encoder = EncoderNet().to(device)
-    decoder = DecoderNet().to(device)
+    encoder.train()
+    decoder.train()
 
-    optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(decoder.parameters()),
-        lr=1e-4
-    )
+    total_loss = 0
+    print(f"\nEpoch {epoch+1}/{EPOCHS}")
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=5, factor=0.5
-    )
+    for imgs, _ in tqdm(loader):
+        imgs = imgs.to(DEVICE)
 
-    scaler = torch.cuda.amp.GradScaler()
-    perceptual_loss_fn = PerceptualLoss().to(device)
+        # -------- WATERMARK --------
+        wm_np = np.random.randint(0, 2, (imgs.size(0), 32, 32))
 
-    dataset = DIV2KDataset(DATASET_PATH)
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
+        wm_secure = np.stack([
+            secure_encode(wm_np[i], KEY)
+            for i in range(len(wm_np))
+        ])
 
-    Path(WEIGHTS_DIR).mkdir(parents=True, exist_ok=True)
-    Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
+        wm = torch.tensor(wm_secure).float().unsqueeze(1).to(DEVICE)
 
-    start_epoch, best_loss = load_checkpoint(encoder, decoder, optimizer, scheduler)
+        # -------- ENCODER --------
+        residual = encoder(imgs, wm)
+        watermarked = torch.clamp(imgs + EMBED_STRENGTH * residual, 0, 1)
 
-    for epoch in range(start_epoch, start_epoch + EPOCHS):
-        total_loss = 0
+        # -------- ATTACK SCHEDULING --------
+        if epoch < 5:
+            attacked = watermarked
 
-        for x in loader:
-            x = x.to(device, non_blocking=True)
+        elif epoch < 10:
+            attacked = random_attack(watermarked, epoch=10)
 
-            wm = torch.randint(0, 2, (x.size(0), 1, 32, 32), device=device).float()
+        else:
+            attacked = random_attack(watermarked, epoch=25)
 
-            with torch.cuda.amp.autocast():
-                watermarked = encoder(x, wm)
-                attacked = random_attack(watermarked, epoch)
-                pred = decoder(attacked)
+        # -------- DECODER --------
+        pred = decoder(attacked)
 
-                loss_img = image_loss(x, watermarked)
-                loss_wm = watermark_loss(pred, wm)
-                loss_perc = perceptual_loss_fn(watermarked, x)
+        # -------- LOSS --------
+        wm_loss = watermark_loss(pred, wm)
+        img_loss = image_loss(imgs, watermarked)
 
-                corrected = decoder.stn(attacked)
-                stn_reg = torch.mean((attacked - corrected) ** 2)
+        loss = wm_loss + 2.5 * img_loss
 
-                loss = (
-                    1.5 * loss_img +
-                    1.0 * loss_wm +
-                    0.3 * loss_perc +
-                    0.1 * stn_reg
-                )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        total_loss += loss.item()
 
-            total_loss += loss.item()
+    print("Train Loss:", round(total_loss / len(loader), 4))
 
-        avg_loss = total_loss / len(loader)
-        print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}")
+    # ================= VALIDATION =================
+    encoder.eval()
+    decoder.eval()
 
-        scheduler.step(avg_loss)
+    correct = 0
+    total = 0
+    wrong_correct = 0
 
-        # SAVE CHECKPOINT
-        torch.save({
-            'epoch': epoch,
-            'encoder_state': encoder.state_dict(),
-            'decoder_state': decoder.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'scheduler_state': scheduler.state_dict(),
-            'best_loss': best_loss
-        }, CHECKPOINT_PATH)
+    with torch.no_grad():
+        for imgs, _ in loader:
+            imgs = imgs.to(DEVICE)
 
-        # SAVE BEST MODEL
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(encoder.state_dict(), f"{WEIGHTS_DIR}/best_encoder.pth")
-            torch.save(decoder.state_dict(), f"{WEIGHTS_DIR}/best_decoder.pth")
-            print("✅ Best model saved")
+            wm_np = np.random.randint(0, 2, (imgs.size(0), 32, 32))
 
-    print("🎉 Training Completed")
+            wm_secure = np.stack([
+                secure_encode(wm_np[i], KEY)
+                for i in range(len(wm_np))
+            ])
 
-if __name__ == "__main__":
-    main()
+            wm = torch.tensor(wm_secure).float().unsqueeze(1).to(DEVICE)
+
+            residual = encoder(imgs, wm)
+            watermarked = torch.clamp(imgs + EMBED_STRENGTH * residual, 0, 1)
+
+            pred = decoder(watermarked)
+            pred_bin = (torch.sigmoid(pred) > 0.5).float().cpu().numpy()
+
+            for i in range(len(pred_bin)):
+                decoded = secure_decode(pred_bin[i, 0], KEY)
+                true = secure_decode(wm_np[i], KEY)
+
+                correct += (decoded == true).sum()
+                total += true.size
+
+                wrong = secure_decode(pred_bin[i, 0], "wrong_key")
+                wrong_correct += (wrong == true).sum()
+
+    acc = correct / total
+    wrong_acc = wrong_correct / total
+
+    print(f"Val Acc: {acc:.4f} | Wrong Key Acc: {wrong_acc:.4f}")
+
+    # ================= SAVE =================
+    torch.save({
+        "epoch": epoch,
+        "encoder": encoder.state_dict(),
+        "decoder": decoder.state_dict(),
+        "optimizer": optimizer.state_dict()
+    }, ckpt_path)
+
+    torch.save(encoder.state_dict(), os.path.join(CHECKPOINT_DIR, "encoder_latest.pth"))
+    torch.save(decoder.state_dict(), os.path.join(CHECKPOINT_DIR, "decoder_latest.pth"))

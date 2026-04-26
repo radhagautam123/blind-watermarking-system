@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.stn import STN
+from models.attention import ChannelAttention, SpatialAttention
 
 
 class ConvBlock(nn.Module):
@@ -22,36 +23,58 @@ class DecoderNet(nn.Module):
         super().__init__()
         self.wm_size = wm_size
 
-        # 🔥 STN module
+        # -------- STN (geometry correction) --------
         self.stn = STN()
 
-        self.net = nn.Sequential(
-            ConvBlock(3, 64),
-            nn.MaxPool2d(2),
+        # -------- FEATURE EXTRACTION --------
+        self.c1 = ConvBlock(3, 64)
+        self.ca1 = ChannelAttention(64)
+        self.sa1 = SpatialAttention()
 
-            ConvBlock(64, 128),
-            nn.MaxPool2d(2),
+        self.c2 = ConvBlock(64, 128)
+        self.ca2 = ChannelAttention(128)
+        self.sa2 = SpatialAttention()
 
-            ConvBlock(128, 256),
-            nn.MaxPool2d(2),
+        self.c3 = ConvBlock(128, 256)
+        self.ca3 = ChannelAttention(256)
+        self.sa3 = SpatialAttention()
 
-            ConvBlock(256, 512),
+        self.c4 = ConvBlock(256, 512)
 
-            nn.Conv2d(512, 1, 1),
-            nn.Sigmoid()
-        )
+        self.pool = nn.MaxPool2d(2)
+
+        # -------- FINAL --------
+        self.final = nn.Conv2d(512, 1, 1)
 
     def forward(self, x):
-        # 🔥 Correct geometric distortions
+
+        # -------- STN --------
         x = self.stn(x)
 
-        y = self.net(x)
+        # -------- FEATURE EXTRACTION + ATTENTION --------
+        x = self.c1(x)
+        x = x + self.sa1(self.ca1(x)) * 0.5
+        x = self.pool(x)
 
-        y = F.interpolate(
-            y,
+        x = self.c2(x)
+        x = x + self.sa2(self.ca2(x)) * 0.5
+        x = self.pool(x)
+
+        x = self.c3(x)
+        x = x + self.sa3(self.ca3(x)) * 0.5
+        x = self.pool(x)
+
+        x = self.c4(x)
+
+        # -------- OUTPUT (NO SIGMOID) --------
+        x = self.final(x)
+
+        # -------- RESIZE TO WATERMARK --------
+        x = F.interpolate(
+            x,
             size=(self.wm_size, self.wm_size),
             mode='bilinear',
             align_corners=False
         )
 
-        return y
+        return x

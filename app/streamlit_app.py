@@ -35,8 +35,8 @@ def load_models():
     encoder = EncoderNet().to(device)
     decoder = DecoderNet().to(device)
 
-    enc_path = os.path.join(BASE_DIR, 'weights', 'encoder_best.pth')
-    dec_path = os.path.join(BASE_DIR, 'weights', 'decoder_best.pth')
+    enc_path = os.path.join(BASE_DIR, 'weights', 'encoder_latest.pth')
+    dec_path = os.path.join(BASE_DIR, 'weights', 'decoder_latest.pth')
 
     encoder.load_state_dict(torch.load(enc_path, map_location=device))
     decoder.load_state_dict(torch.load(dec_path, map_location=device))
