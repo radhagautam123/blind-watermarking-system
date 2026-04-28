@@ -27,6 +27,8 @@ class SpatialAttention(nn.Module):
     def forward(self, x):
         avg = torch.mean(x, dim=1, keepdim=True)
         mx, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg, mx], dim=1)
-        attn = torch.sigmoid(self.conv(x))
-        return x * attn
+
+        x_cat = torch.cat([avg, mx], dim=1)
+        attn = torch.sigmoid(self.conv(x_cat))
+
+        return x * attn   # ✅ CRITICAL FIX

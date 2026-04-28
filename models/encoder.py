@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.attention import ChannelAttention, SpatialAttention
 
+
 class ConvBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -10,7 +11,6 @@ class ConvBlock(nn.Module):
             nn.Conv2d(in_c, out_c, 3, padding=1),
             nn.BatchNorm2d(out_c),
             nn.ReLU(),
-
             nn.Conv2d(out_c, out_c, 3, padding=1),
             nn.BatchNorm2d(out_c),
             nn.ReLU()
@@ -26,7 +26,8 @@ class EncoderNet(nn.Module):
 
         self.pool = nn.MaxPool2d(2)
 
-        self.c1 = ConvBlock(4, 64)
+        # 3 (img) + 1 (wm) + 1 (key)
+        self.c1 = ConvBlock(5, 64)
         self.ca1 = ChannelAttention(64)
         self.sa1 = SpatialAttention()
 
@@ -51,10 +52,30 @@ class EncoderNet(nn.Module):
 
         self.final = nn.Conv2d(64, 3, 1)
 
-    def forward(self, img, wm):
-        wm = F.interpolate(wm, size=img.shape[2:])
-        x = torch.cat([img, wm], dim=1)
+    def forward(self, img, wm, key):
 
+        # ================= FIX WATERMARK SHAPE =================
+        # Accepts (32,32), (1,32,32), (B,32,32), or (B,1,32,32)
+        if wm.dim() == 2:
+            wm = wm.unsqueeze(0).unsqueeze(0)
+
+        elif wm.dim() == 3:
+            wm = wm.unsqueeze(1)
+
+        # Ensure correct shape
+        wm = wm.view(wm.size(0), 1, 32, 32)
+
+        # Resize watermark to match image
+        wm = F.interpolate(wm, size=img.shape[2:], mode='bilinear', align_corners=False)
+
+        # ================= FIX KEY SHAPE =================
+        key_map = F.interpolate(key, size=img.shape[2:], mode='bilinear', align_corners=False)
+        key_map = key_map.expand(img.size(0), -1, -1, -1)
+
+        # ================= CONCAT =================
+        x = torch.cat([img, wm, key_map], dim=1)
+
+        # ================= ENCODER =================
         c1 = self.sa1(self.ca1(self.c1(x)))
         c2 = self.sa2(self.ca2(self.c2(self.pool(c1))))
         c3 = self.sa3(self.ca3(self.c3(self.pool(c2))))
@@ -73,4 +94,6 @@ class EncoderNet(nn.Module):
         x = torch.cat([x, c1], dim=1)
         x = self.u3(x)
 
-        return torch.tanh(self.final(x))
+        # ================= OUTPUT =================
+        delta = torch.tanh(self.final(x)) * 0.05
+        return delta

@@ -13,10 +13,16 @@ def generate_key_stream(n_bits: int, secret_key: str):
 
 
 def encrypt_watermark_bits(wm_bits: np.ndarray, secret_key: str):
+    """
+    Input: wm_bits shape (32, 32)
+    Output: same shape (32, 32)
+    """
     flat = wm_bits.flatten().astype(np.uint8)
     key_stream = generate_key_stream(len(flat), secret_key)
     encrypted = np.bitwise_xor(flat, key_stream)
-    return encrypted
+
+    # 🔥 CRITICAL FIX: RETURN SAME SHAPE
+    return encrypted.reshape(wm_bits.shape)
 
 
 def decrypt_watermark_bits(enc_bits: np.ndarray, secret_key: str, shape):
