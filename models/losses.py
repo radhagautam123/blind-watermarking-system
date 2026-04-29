@@ -25,26 +25,24 @@ def ssim_loss(x, y):
 
 # ---------------- IMAGE LOSS ----------------
 def image_loss(host, watermarked):
-    watermarked = torch.clamp(watermarked, 0, 1)
-
     mse = F.mse_loss(watermarked, host)
     ssim = ssim_loss(watermarked, host)
+    return 0.6 * mse + 0.4 * ssim
 
-    return 0.7 * mse + 0.3 * ssim
+
+# ---------------- DICE LOSS ----------------
+def dice_loss(pred, target):
+    smooth = 1e-8
+    intersection = (pred * target).sum()
+    return 1 - (2 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
 
 
 # ---------------- WATERMARK LOSS ----------------
 def watermark_loss(pred_wm, true_wm):
-    """
-    pred_wm = raw logits from decoder
-    true_wm = 0/1
-    """
-
-    # 🔥 FIX: use BCE WITH LOGITS (no sigmoid needed)
     bce = F.binary_cross_entropy_with_logits(pred_wm, true_wm)
 
-    # 🔥 For stability (apply sigmoid only here)
     pred_prob = torch.sigmoid(pred_wm)
     l1 = F.l1_loss(pred_prob, true_wm)
+    dice = dice_loss(pred_prob, true_wm)
 
-    return 0.8 * bce + 0.2 * l1
+    return 0.6 * bce + 0.2 * l1 + 0.2 * dice

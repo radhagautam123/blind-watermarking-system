@@ -1,24 +1,41 @@
-import bchlib
 import numpy as np
 
-# BCH setup
-BCH_POLY = 137
-BCH_BITS = 5
 
-bch = bchlib.BCH(BCH_POLY, BCH_BITS)
+# ---------------- REPETITION ENCODING ----------------
+def repeat_bits(bits, k=3):
+    return np.repeat(bits, k)
 
 
+def majority_vote(bits, k=3):
+    bits = bits.reshape(-1, k)
+    return (np.sum(bits, axis=1) > (k // 2)).astype(np.uint8)
+
+
+# ---------------- ENCODE ----------------
 def encode_bch(data_bits):
-    data_bytes = np.packbits(data_bits)
-    ecc = bch.encode(data_bytes)
-    packet = data_bytes + ecc
-    return np.unpackbits(np.frombuffer(packet, dtype=np.uint8))
+    flat = data_bits.flatten().astype(np.uint8)
+
+    repeated = repeat_bits(flat, k=3)
+
+    # fit back to 1024
+    if len(repeated) > 1024:
+        repeated = repeated[:1024]
+    else:
+        repeated = np.pad(repeated, (0, 1024 - len(repeated)))
+
+    return repeated.reshape(32, 32)
 
 
+# ---------------- DECODE ----------------
 def decode_bch(received_bits):
-    packet = np.packbits(received_bits)
-    data, ecc = packet[:-bch.ecc_bytes], packet[-bch.ecc_bytes:]
+    flat = received_bits.flatten().astype(np.uint8)
 
-    bitflips = bch.decode(data, ecc)
+    usable_len = (len(flat) // 3) * 3
+    flat = flat[:usable_len]
 
-    return np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+    decoded = majority_vote(flat, k=3)
+
+    if len(decoded) < 1024:
+        decoded = np.pad(decoded, (0, 1024 - len(decoded)))
+
+    return decoded[:1024].reshape(32, 32)

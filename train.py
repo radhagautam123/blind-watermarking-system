@@ -9,22 +9,26 @@ from PIL import Image
 
 from models.encoder import EncoderNet
 from models.decoder import DecoderNet
-from models.losses import image_loss
+from models.losses import watermark_loss, image_loss
 from models.attack_layer import random_attack
 from utils.ecc import encrypt_watermark_bits
+from utils.error_correction import encode_bch
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Using device:", DEVICE)
 
 BATCH_SIZE = 4
-EPOCHS = 25
+EPOCHS = 50
 LR = 1e-4
 
 SAVE_DIR = "/kaggle/working/checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint.pth")
+
 import hashlib
-import random, string
+import random
+import string
 
 def random_key():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -45,10 +49,8 @@ def key_to_tensor(key, size=32):
 class DIV2KDataset(Dataset):
     def __init__(self, root, transform=None):
         self.root = root
-        self.images = [
-            f for f in os.listdir(root)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
+        self.images = [f for f in os.listdir(root)
+                       if f.lower().endswith((".png", ".jpg", ".jpeg"))]
         self.transform = transform
 
     def __getitem__(self, idx):
@@ -76,52 +78,68 @@ encoder = EncoderNet().to(DEVICE)
 decoder = DecoderNet().to(DEVICE)
 
 optimizer = optim.Adam(
-    list(encoder.parameters()) + list(decoder.parameters()),
-    lr=LR
+    list(encoder.parameters()) + list(decoder.parameters()), lr=LR
 )
 
-for epoch in range(EPOCHS):
+start_epoch = 0
+
+# ---------------- RESUME ----------------
+if os.path.exists(CHECKPOINT_PATH):
+    print("🔄 Loading checkpoint...")
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+
+    encoder.load_state_dict(checkpoint['encoder'])
+    decoder.load_state_dict(checkpoint['decoder'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+
+    start_epoch = checkpoint['epoch'] + 1
+    print("✅ Resumed from epoch", start_epoch)
+
+# ---------------- TRAIN ----------------
+for epoch in range(start_epoch, EPOCHS):
 
     encoder.train()
     decoder.train()
 
-    print(f"Epoch {epoch+1}/{EPOCHS}")
+    print("Epoch {}/{}".format(epoch+1, EPOCHS))
 
     total_loss = 0
 
     for imgs, _ in tqdm(loader):
         imgs = imgs.to(DEVICE)
 
-        wm_np = np.random.randint(0, 2, (imgs.size(0), 32, 32))
+        wm_np = np.random.randint(0, 2, (imgs.size(0), 32, 32)).astype(np.uint8)
 
-        key = random_key()
-        key_tensor = key_to_tensor(key).to(DEVICE)
+        key_tensors = []
+        wm_secure_list = []
 
-        wm_secure = np.stack([
-            encrypt_watermark_bits(wm_np[i], key).reshape(32, 32)
-            for i in range(len(wm_np))
-        ])
+        for i in range(imgs.size(0)):
+            key = random_key()
+
+            key_tensor = key_to_tensor(key)
+            key_tensors.append(key_tensor)
+
+            wm_encoded = encode_bch(wm_np[i])
+            wm_secure = encrypt_watermark_bits(wm_encoded, key)
+
+            wm_secure_list.append(wm_secure)
+
+        key_tensor = torch.cat(key_tensors, dim=0).to(DEVICE)
+        wm_secure = np.stack(wm_secure_list)
 
         wm = torch.from_numpy(wm_secure).float().unsqueeze(1).to(DEVICE)
 
         residual = encoder(imgs, wm, key_tensor)
         watermarked = torch.clamp(imgs + residual, 0, 1)
 
-        if epoch < 5:
-            attacked = watermarked
-        elif epoch < 12:
-            attacked = random_attack(watermarked, epoch=10)
-        else:
-            attacked = random_attack(watermarked, epoch=25)
+        attacked = random_attack(watermarked).float()
 
         pred = decoder(attacked, key_tensor)
 
-        wm_loss = torch.nn.functional.binary_cross_entropy_with_logits(pred, wm)
-        pred_sigmoid = torch.sigmoid(pred)
-        l1_loss = torch.nn.functional.l1_loss(pred_sigmoid, wm)
+        wm_loss = watermark_loss(pred, wm)
         img_loss = image_loss(imgs, watermarked)
 
-        loss = 6.0 * wm_loss + 2.0 * l1_loss + 1.0 * img_loss
+        loss = 8.0 * wm_loss + 1.0 * img_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -131,5 +149,14 @@ for epoch in range(EPOCHS):
 
     print("Epoch Loss:", total_loss / len(loader))
 
+    # -------- SAVE CHECKPOINT --------
+    torch.save({
+        'epoch': epoch,
+        'encoder': encoder.state_dict(),
+        'decoder': decoder.state_dict(),
+        'optimizer': optimizer.state_dict()
+    }, CHECKPOINT_PATH)
+
+    # -------- ALSO SAVE FINAL WEIGHTS --------
     torch.save(encoder.state_dict(), os.path.join(SAVE_DIR, "encoder.pth"))
     torch.save(decoder.state_dict(), os.path.join(SAVE_DIR, "decoder.pth"))
