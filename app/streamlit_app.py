@@ -1,235 +1,879 @@
-import sys, os, hashlib, math, io
+import os
+import sys
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
-import numpy as np
-from PIL import Image
-import torchvision.transforms as transforms
-import torch.nn.functional as F
-import cv2
+import torchvision.transforms.functional as TF
+from PIL import Image, ImageOps
+from torchvision.transforms.functional import InterpolationMode
 
-# ================= PATH =================
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.encoder import EncoderNet
 from models.decoder import DecoderNet
-from utils.ecc import encrypt_watermark_bits, decrypt_watermark_bits
+from models.attack_layer import targeted_attack, random_attack
+from utils.preprocess import load_binary_watermark
+from utils.metrics import normalized_correlation
+from utils.wm_pipeline import (
+    decode_from_logits,
+    encode_for_embedding,
+    key_to_tensor,
+    prepare_plain_watermark,
+    wm_secure_to_tensor,
+)
 
-# ================= CONFIG =================
-st.set_page_config(layout="wide", page_title="🔐 Blind Watermarking")
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+st.set_page_config(
+    page_title="Blind Watermarking System",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-ENC_PATH = os.path.join(PROJECT_ROOT, "weights", "encoder.pth")
-DEC_PATH = os.path.join(PROJECT_ROOT, "weights", "decoder.pth")
+st.markdown("""
+<style>
+.block-container {
+    max-width: 1450px !important;
+    padding-top: 1rem !important;
+    padding-bottom: 2rem !important;
+    padding-left: 1.5rem !important;
+    padding-right: 1.5rem !important;
+}
+section[data-testid="stSidebar"] {
+    width: 340px !important;
+    min-width: 340px !important;
+}
+section[data-testid="stSidebar"] > div {
+    width: 340px !important;
+}
+h1 {
+    font-size: 2.3rem !important;
+    font-weight: 800 !important;
+    margin-bottom: 0.2rem !important;
+}
+h2, h3 {
+    font-size: 1.3rem !important;
+    font-weight: 700 !important;
+}
+.stButton > button, .stDownloadButton > button {
+    width: 100%;
+    min-height: 3rem;
+    font-size: 1rem !important;
+    font-weight: 700 !important;
+    border-radius: 12px !important;
+}
+div[data-testid="stMetric"] {
+    border: 1px solid rgba(255,255,255,0.08) !important;
+    padding: 0.9rem 1rem !important;
+    border-radius: 14px !important;
+}
+img {
+    border-radius: 12px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-transform = transforms.Compose([
-    transforms.Resize((256,256)),
-    transforms.ToTensor()
-])
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+WM_SIZE = 32
 
-# ================= KEY =================
-def key_to_tensor(key, size=32):
-    hash_bytes = b''
-    current = key.encode()
+CHECKPOINT_SEARCH_DIRS = [
+    PROJECT_ROOT / "checkpoints",
+    PROJECT_ROOT / "models",
+]
+_env_ckpt_dir = os.environ.get("WM_CHECKPOINT_DIR")
+if _env_ckpt_dir:
+    CHECKPOINT_SEARCH_DIRS.insert(0, Path(_env_ckpt_dir))
 
-    while len(hash_bytes) < size*size:
-        current = hashlib.sha256(current).digest()
-        hash_bytes += current
+KNOWN_CHECKPOINT_NAMES = [
+    "checkpoint_best_ber.pth",
+    "checkpoint_best_attack_ber.pth",
+    "checkpoint_best_clean_ber.pth",
+    "checkpoint_best_psnr.pth",
+    "checkpoint_best.pth",
+    "checkpoint_latest.pth",
+    "best_encoder.pth",
+    "best_decoder.pth",
+]
 
-    arr = np.frombuffer(hash_bytes[:size*size], dtype=np.uint8)
-    arr = arr.astype(np.float32)/255.0
-    return torch.tensor(arr).view(1,1,size,size)
+ATTACK_CHOICES = [
+    "None",
+    "JPEG 50",
+    "JPEG 30",
+    "Blur",
+    "Noise 0.03",
+    "Noise 0.05",
+    "Rotate 10",
+    "Rotate 15",
+    "Crop 80",
+    "Crop 70",
+    "Resize 70",
+    "Zoom 120",
+    "Brightness",
+    "Contrast",
+    "Salt & Pepper",
+    "Translate",
+    "Random Medium",
+    "Random Strong",
+]
 
-# ================= METRICS =================
-def psnr(img1, img2):
-    mse = np.mean((img1 - img2) ** 2)
-    return 20 * np.log10(255.0 / np.sqrt(mse + 1e-8))
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def pil_to_tensor(img, size=(256, 256)):
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = img.resize(size, Image.Resampling.BICUBIC)
+    arr = np.array(img).astype(np.float32) / 255.0
+    tensor = torch.tensor(arr).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+    return tensor, np.array(img)
+
+
+def tensor_to_rgb_np(t):
+    x = t.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    return (x * 255).astype(np.uint8)
+
+
+def psnr(x, y, eps=1e-8):
+    x = x.astype(np.float32) / 255.0
+    y = y.astype(np.float32) / 255.0
+    mse = np.mean((x - y) ** 2)
+    if mse <= eps:
+        return 99.0
+    return 10.0 * np.log10(1.0 / mse)
+
 
 def ssim(img1, img2):
-    img1 = img1.astype(np.float64)
-    img2 = img2.astype(np.float64)
-    C1, C2 = 6.5, 58.5
+    img1 = img1.astype(np.float64) / 255.0
+    img2 = img2.astype(np.float64) / 255.0
 
-    mu1, mu2 = img1.mean(), img2.mean()
-    sigma1, sigma2 = img1.var(), img2.var()
-    sigma12 = ((img1-mu1)*(img2-mu2)).mean()
+    if img1.ndim == 3:
+        vals = [ssim(img1[..., c], img2[..., c]) for c in range(img1.shape[2])]
+        return float(np.mean(vals))
 
-    return ((2*mu1*mu2+C1)*(2*sigma12+C2))/((mu1**2+mu2**2+C1)*(sigma1+sigma2+C2))
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+    num = (2 * mu1_mu2 + c1) * (2 * sigma12 + c2)
+    den = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
+    return float((num / (den + 1e-8)).mean())
 
-# ================= LOAD MODELS =================
-@st.cache_resource
-def load_models():
-    enc = EncoderNet().to(device)
-    dec = DecoderNet().to(device)
 
-    enc.load_state_dict(torch.load(ENC_PATH, map_location=device))
-    dec.load_state_dict(torch.load(DEC_PATH, map_location=device))
+def ber_and_accuracy(true_wm, pred_wm):
+    true_bits = (true_wm > 0).astype(np.uint8)
+    pred_bits = (pred_wm > 0).astype(np.uint8)
+    ber = np.mean(true_bits != pred_bits)
+    return float(ber), float(1.0 - ber)
 
-    enc.eval()
-    dec.eval()
-    return enc, dec
 
-encoder, decoder = load_models()
+def prepare_watermark(uploaded_file):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
+    try:
+        wm = load_binary_watermark(
+            tmp_path,
+            size=(WM_SIZE, WM_SIZE),
+            threshold=127,
+            cleanup=True,
+            center=True,
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return wm.astype(np.uint8)
 
-# ================= UI =================
-st.title("🔐 Blind Watermarking System")
 
-st.sidebar.header("⚙️ Controls")
-secret_key = st.sidebar.text_input("🔑 Secret Key", type="password")
+def png_bytes_from_array(arr):
+    bio = BytesIO()
+    Image.fromarray(arr).save(bio, format="PNG")
+    return bio.getvalue()
 
-attack = st.sidebar.selectbox("Attack", [
-    "None","Gaussian Noise","JPEG","Rotation","Resize","Crop",
-    "Blur","Brightness","Contrast","SaltPepper","Sharpen"
-])
 
-noise = st.sidebar.slider("Noise",0.0,0.2,0.05)
-jpeg_q = st.sidebar.slider("JPEG Quality",10,100,50)
-angle = st.sidebar.slider("Rotation",-45,45,10)
-scale = st.sidebar.slider("Resize",0.3,1.0,0.7)
-crop_scale = st.sidebar.slider("Crop",0.5,1.0,0.8)
-blur_k = st.sidebar.slider("Blur",1,9,5,step=2)
-brightness_f = st.sidebar.slider("Brightness",0.5,2.0,1.2)
-contrast_f = st.sidebar.slider("Contrast",0.5,2.0,1.2)
-sp_p = st.sidebar.slider("SaltPepper",0.0,0.1,0.02)
+# ── rotation-robust extraction ────────────────────────────────────────────────
 
-# ================= INPUT =================
-col1, col2 = st.columns(2)
+_SEARCH_ANGLES = [-15, -12, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 15]
 
-with col1:
-    host_file = st.file_uploader("Upload Host Image")
 
-with col2:
-    wm_file = st.file_uploader("Upload Watermark (32x32)")
+def derotate_and_decode(attacked_tensor, decoder, key_tensor, wrong_key_tensor):
+    """
+    Sweep inverse rotations over a candidate grid and pick the orientation
+    where decoder confidence is highest (bits furthest from 0.5).
+    Returns (best_logits, wrong_logits, estimated_angle_deg).
+    """
+    best_score = -1.0
+    best_logits = None
+    best_angle = 0.0
 
-# ================= EMBEDDING =================
-if st.button("🚀 Embed Watermark"):
-
-    if not host_file or not wm_file or not secret_key:
-        st.error("Provide all inputs")
-    else:
-        host = Image.open(host_file).convert("RGB")
-        wm_img = Image.open(wm_file).convert("L")
-
-        x = transform(host).unsqueeze(0).to(device)
-
-        # 🔥 FIXED WATERMARK HANDLING
-        wm_np = np.array(wm_img)
-        wm_np = (wm_np > 127).astype(np.float32)
-
-        if wm_np.shape != (32,32):
-            wm_np = cv2.resize(wm_np, (32,32))
-
-        wm_np = wm_np.reshape(32,32)
-
-        wm_secure = encrypt_watermark_bits(wm_np, secret_key)
-        wm = torch.tensor(wm_secure, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
-
-        key_tensor = key_to_tensor(secret_key).to(device)
-
-        with torch.no_grad():
-            residual = encoder(x, wm, key_tensor)
-            watermarked = torch.clamp(x + residual,0,1)
-
-        st.session_state["wm"] = wm_np
-        st.session_state["watermarked"] = watermarked
-        st.session_state["host"] = np.array(host.resize((256,256)))
-
-        out = (watermarked.squeeze().permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
-
-        st.image(out, caption="Watermarked")
-
-        buf = io.BytesIO()
-        Image.fromarray(out).save(buf, format="PNG")
-        st.download_button("⬇ Download Watermarked", buf.getvalue(), "watermarked.png")
-
-# ================= EXTRACTION =================
-extract_key = st.text_input("🔑 Extraction Key", type="password")
-
-if st.button("🔍 Extract Watermark"):
-
-    if "watermarked" not in st.session_state:
-        st.error("First embed watermark")
-    else:
-        attacked = st.session_state["watermarked"].clone()
-
-        # ================= ATTACKS =================
-        if attack=="Gaussian Noise":
-            attacked = torch.clamp(attacked + torch.randn_like(attacked)*noise,0,1)
-
-        elif attack=="JPEG":
-            img = (attacked.squeeze().permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
-            _, enc = cv2.imencode('.jpg', img,[int(cv2.IMWRITE_JPEG_QUALITY),jpeg_q])
-            dec = cv2.imdecode(enc,1)
-            attacked = torch.tensor(dec/255.).permute(2,0,1).unsqueeze(0).float()
-
-        elif attack=="Rotation":
-            attacked = transforms.functional.rotate(attacked, angle)
-
-        elif attack=="Resize":
-            attacked = F.interpolate(attacked, scale_factor=scale)
-            attacked = F.interpolate(attacked, size=(256,256))
-
-        elif attack=="Crop":
-            attacked = attacked[:,:,0:int(256*crop_scale),0:int(256*crop_scale)]
-            attacked = F.interpolate(attacked,size=(256,256))
-
-        elif attack=="Blur":
-            attacked = transforms.functional.gaussian_blur(attacked, blur_k)
-
-        elif attack=="Brightness":
-            attacked = torch.clamp(attacked*brightness_f,0,1)
-
-        elif attack=="Contrast":
-            m = attacked.mean()
-            attacked = torch.clamp((attacked-m)*contrast_f+m,0,1)
-
-        elif attack=="SaltPepper":
-            noise = torch.rand_like(attacked)
-            attacked = attacked.clone()
-            attacked[noise<sp_p] = 0
-            attacked[noise>1-sp_p] = 1
-
-        elif attack=="Sharpen":
-            kernel = torch.tensor([[0,-1,0],[-1,5,-1],[0,-1,0]]).float().to(device)
-            kernel = kernel.view(1,1,3,3).repeat(3,1,1,1)
-            attacked = F.conv2d(attacked, kernel, padding=1, groups=3)
-
-        # ================= DECODE =================
-        key_tensor = key_to_tensor(extract_key).to(device)
-
-        with torch.no_grad():
-            pred = decoder(attacked, key_tensor)
-
-        pred_bin = (torch.sigmoid(pred)>0.5).float().cpu().numpy()
-
-        decoded = decrypt_watermark_bits(pred_bin[0,0], extract_key,(32,32))
-        extracted = (decoded*255).astype(np.uint8)
-
-        st.image(extracted, caption="Extracted", width=200)
-
-        buf = io.BytesIO()
-        Image.fromarray(extracted).save(buf, format="PNG")
-        st.download_button("⬇ Download Extracted", buf.getvalue(), "extracted.png")
-
-        # ================= METRICS =================
-        wm_true = st.session_state["wm"]
-
-        ber = np.mean(decoded!=wm_true)
-        acc = 1-ber
-
-        psnr_val = psnr(st.session_state["host"], 
-                       (st.session_state["watermarked"].squeeze().permute(1,2,0).cpu().numpy()*255))
-
-        ssim_val = ssim(st.session_state["host"], 
-                       (st.session_state["watermarked"].squeeze().permute(1,2,0).cpu().numpy()*255))
-
-        st.subheader("📊 Metrics")
-        st.write(f"PSNR: {psnr_val:.2f}")
-        st.write(f"SSIM: {ssim_val:.4f}")
-        st.write(f"BER: {ber:.4f}")
-        st.write(f"Accuracy: {acc:.4f}")
-
-        if ber > 0.3:
-            st.error("❌ Wrong Key / Strong Attack")
+    for angle in _SEARCH_ANGLES:
+        if abs(angle) < 1e-3:
+            rotated = attacked_tensor
         else:
-            st.success("✅ Correct Key")
+            rotated = TF.rotate(
+                attacked_tensor,
+                angle=-angle,
+                interpolation=InterpolationMode.BILINEAR,
+                expand=False,
+                fill=0.5,
+            )
+        with torch.no_grad():
+            logits = decoder(rotated, key_tensor)
+        conf = torch.mean(torch.abs(torch.sigmoid(logits) - 0.5)).item()
+        if conf > best_score:
+            best_score = conf
+            best_logits = logits
+            best_angle = angle
+
+    # Decode wrong key at the best orientation
+    wrong_logits = None
+    if wrong_key_tensor is not None:
+        if abs(best_angle) < 1e-3:
+            best_rotated = attacked_tensor
+        else:
+            best_rotated = TF.rotate(
+                attacked_tensor,
+                angle=-best_angle,
+                interpolation=InterpolationMode.BILINEAR,
+                expand=False,
+                fill=0.5,
+            )
+        with torch.no_grad():
+            wrong_logits = decoder(best_rotated, wrong_key_tensor)
+
+    return best_logits, wrong_logits, best_angle
+
+
+# ── checkpoint helpers ────────────────────────────────────────────────────────
+
+def _torch_load(path):
+    try:
+        return torch.load(path, map_location=DEVICE, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=DEVICE)
+
+
+def _peek_checkpoint_meta(path: Path):
+    meta = {"epoch": None, "best_ber": None, "val_psnr": None, "val_ber_attack": None}
+    try:
+        ckpt = _torch_load(path)
+        if isinstance(ckpt, dict):
+            meta.update({k: ckpt.get(k) for k in meta})
+            meta["kind"] = "full" if ("encoder" in ckpt and "decoder" in ckpt) else "partial"
+        else:
+            meta["kind"] = "state_dict"
+    except Exception as exc:
+        meta["kind"] = "error"
+        meta["error"] = str(exc)
+    return meta
+
+
+def _format_checkpoint_label(path: Path):
+    meta = _peek_checkpoint_meta(path)
+    parts = [path.name]
+    if meta.get("epoch") is not None:
+        parts.append(f"epoch {int(meta['epoch']) + 1}")
+    best_ber = meta.get("best_ber")
+    if best_ber is not None and best_ber == best_ber and best_ber < 1e6:
+        parts.append(f"best_ber {best_ber:.4f}")
+    val_atk = meta.get("val_ber_attack")
+    if val_atk is not None and val_atk == val_atk:
+        parts.append(f"val_atk {val_atk:.4f}")
+    val_psnr = meta.get("val_psnr")
+    if val_psnr is not None and val_psnr == val_psnr:
+        parts.append(f"psnr {val_psnr:.1f}")
+    if meta.get("kind") == "partial":
+        parts.append(meta["kind"])
+    return " | ".join(parts)
+
+
+@st.cache_data(ttl=30)
+def discover_checkpoints():
+    found = {}
+    seen = set()
+    for directory in CHECKPOINT_SEARCH_DIRS:
+        if not directory.exists():
+            continue
+        candidates = [directory / n for n in KNOWN_CHECKPOINT_NAMES]
+        candidates += sorted(directory.glob("checkpoint_epoch_*.pth"))
+        candidates += sorted(directory.glob("*.pth"))
+        for path in candidates:
+            if not path.is_file():
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            label = _format_checkpoint_label(path)
+            if label in found:
+                label = f"{label} ({directory.name})"
+            found[label] = path
+    return dict(sorted(found.items(), key=lambda kv: kv[1].name))
+
+
+def _load_split_encoder_decoder(encoder, decoder, path: Path):
+    name = path.name.lower()
+    parent = path.parent
+    enc_path = path if "encoder" in name else parent / "best_encoder.pth"
+    dec_path = path if "decoder" in name else parent / "best_decoder.pth"
+    if not enc_path.exists():
+        raise FileNotFoundError(f"Encoder weights not found: {enc_path}")
+    if not dec_path.exists():
+        raise FileNotFoundError(f"Decoder weights not found: {dec_path}")
+    enc_info = encoder.load_state_dict(_torch_load(enc_path), strict=False)
+    dec_info = decoder.load_state_dict(_torch_load(dec_path), strict=False)
+    return enc_info, dec_info, {}
+
+
+def _load_full_checkpoint(encoder, decoder, ckpt_path: Path):
+    ckpt = _torch_load(ckpt_path)
+    if isinstance(ckpt, dict) and "encoder" in ckpt and "decoder" in ckpt:
+        enc_info = encoder.load_state_dict(ckpt["encoder"], strict=False)
+        dec_info = decoder.load_state_dict(ckpt["decoder"], strict=False)
+        return enc_info, dec_info, {
+            "epoch": ckpt.get("epoch"),
+            "best_ber": ckpt.get("best_ber"),
+            "val_psnr": ckpt.get("val_psnr"),
+            "val_ber_attack": ckpt.get("val_ber_attack"),
+            "arch_version": ckpt.get("arch_version"),
+        }
+    raise RuntimeError(
+        f"Unsupported checkpoint format: {ckpt_path}. "
+        "Expected dict with 'encoder' and 'decoder' keys."
+    )
+
+
+@st.cache_resource
+def load_models(checkpoint_path_str: str):
+    ckpt_path = Path(checkpoint_path_str)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    encoder = EncoderNet(wm_size=WM_SIZE).to(DEVICE)
+    decoder = DecoderNet(wm_size=WM_SIZE).to(DEVICE)
+    name_lower = ckpt_path.name.lower()
+    if "encoder" in name_lower or "decoder" in name_lower:
+        enc_info, dec_info, meta = _load_split_encoder_decoder(encoder, decoder, ckpt_path)
+    else:
+        enc_info, dec_info, meta = _load_full_checkpoint(encoder, decoder, ckpt_path)
+    encoder.eval()
+    decoder.eval()
+    return encoder, decoder, {
+        "path": str(ckpt_path.resolve()),
+        "file_name": ckpt_path.name,
+        **meta,
+        "encoder_missing": enc_info.missing_keys,
+        "encoder_unexpected": enc_info.unexpected_keys,
+        "decoder_missing": dec_info.missing_keys,
+        "decoder_unexpected": dec_info.unexpected_keys,
+    }
+
+
+def apply_selected_attack(img_tensor, attack_name):
+    mapping = {
+        "JPEG 50": "jpeg50",
+        "JPEG 30": "jpeg30",
+        "Blur": "blur5",
+        "Noise 0.03": "noise003",
+        "Noise 0.05": "noise005",
+        "Rotate 10": "rotate10",
+        "Rotate 15": "rotate15",
+        "Crop 80": "crop80",
+        "Crop 70": "crop70",
+        "Resize 70": "resize70",
+        "Zoom 120": "zoom120",
+        "Brightness": "brightness",
+        "Contrast": "contrast",
+        "Salt & Pepper": "sp002",
+        "Translate": "translate",
+    }
+    if attack_name == "None":
+        return img_tensor
+    if attack_name in ("Random Medium", "Random Strong"):
+        strength = "medium" if "Medium" in attack_name else "strong"
+        return random_attack(img_tensor, strength=strength)
+    key = mapping.get(attack_name)
+    if key:
+        return targeted_attack(img_tensor, key)
+    return img_tensor
+
+
+def _is_rotation_attack(attack_name: str) -> bool:
+    return "Rotate" in attack_name or "Random" in attack_name
+
+
+# ── session state ─────────────────────────────────────────────────────────────
+
+for key, default in {
+    "watermarked_tensor": None,
+    "watermarked_np": None,
+    "host_np": None,
+    "wm_true": None,
+    "checkpoint_path": None,
+    "last_results": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── sidebar ───────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.header("Controls")
+
+    # Fixed checkpoint
+    selected_ckpt_path = PROJECT_ROOT / "checkpoints" / "checkpoint_epoch_25.pth"
+
+    # Keys
+    st.subheader("Keys")
+
+    embed_key = st.text_input(
+        "Embedding Key",
+        placeholder="Enter embedding key",
+        type="password"
+    )
+
+    extract_key = st.text_input(
+        "Extraction Key",
+        placeholder="Enter extraction key",
+        type="password"
+    )
+
+    st.divider()
+
+    # Attack + robustness
+    st.subheader("Attack")
+    attack_name = st.selectbox("Attack type", ATTACK_CHOICES)
+    use_rotation_search = True
+
+    st.divider()
+
+    # Always enabled internally
+    use_decrypt = True
+    use_bch = True
+
+# ── model loading ─────────────────────────────────────────────────────────────
+
+ckpt_path_str = str(selected_ckpt_path.resolve())
+
+if st.session_state["checkpoint_path"] != ckpt_path_str:
+    for k in ("watermarked_tensor", "watermarked_np", "host_np", "wm_true", "last_results"):
+        st.session_state[k] = None
+    st.session_state["checkpoint_path"] = ckpt_path_str
+
+if selected_ckpt_path is None:
+    st.info("Select or upload a checkpoint in the sidebar to load models.")
+    st.stop()
+
+try:
+    encoder, decoder, load_info = load_models(ckpt_path_str)
+except Exception as e:
+    st.error(f"Model loading failed: {e}")
+    st.exception(e)
+    st.stop()
+
+# ── title + checkpoint summary ────────────────────────────────────────────────
+
+st.title("Blind Watermarking System")
+st.caption(
+    "Embed an invisible watermark into a host image, apply an attack, "
+    "and extract the watermark — with full quality and robustness metrics."
+)
+
+# ── upload panel ──────────────────────────────────────────────────────────────
+
+col_upload_1, col_upload_2 = st.columns(2)
+with col_upload_1:
+    host_file = st.file_uploader("Upload Host Image", type=["png", "jpg", "jpeg"], key="host_file")
+with col_upload_2:
+    wm_file = st.file_uploader("Upload Binary Watermark", type=["png", "jpg", "jpeg"], key="wm_file")
+
+col_btn_1, col_btn_2 = st.columns(2)
+embed_clicked = col_btn_1.button("Embed Watermark", use_container_width=True)
+extract_clicked = col_btn_2.button("Extract Watermark", use_container_width=True)
+
+# ── embed ─────────────────────────────────────────────────────────────────────
+
+if embed_clicked:
+    if host_file is None or wm_file is None:
+        st.warning("Please upload both a host image and a watermark image.")
+    else:
+        host_pil = Image.open(host_file)
+        host_tensor, host_np = pil_to_tensor(host_pil)
+
+        wm_true = prepare_plain_watermark(prepare_watermark(wm_file))
+        wm_secure = encode_for_embedding(wm_true, embed_key)
+        wm_tensor = wm_secure_to_tensor(wm_secure, device=DEVICE)
+        key_tensor = key_to_tensor(embed_key, size=WM_SIZE, device=DEVICE)
+
+        with torch.no_grad():
+            residual = encoder(host_tensor, wm_tensor, key_tensor)
+            watermarked_tensor = torch.clamp(host_tensor + residual, 0, 1)
+
+        watermarked_np = tensor_to_rgb_np(watermarked_tensor)
+        psnr_embed = psnr(host_np, watermarked_np)
+
+        st.session_state["watermarked_tensor"] = watermarked_tensor
+        st.session_state["watermarked_np"] = watermarked_np
+        st.session_state["host_np"] = host_np
+        st.session_state["wm_true"] = wm_true
+        st.session_state["last_results"] = None
+
+        st.success(f"Watermark embedded — PSNR: {psnr_embed:.2f} dB")
+
+        ec1, ec2 = st.columns(2)
+
+        with ec1:
+            st.image(
+                host_np,
+                caption="Host Image",
+                width=280
+            )
+
+        with ec2:
+            st.image(
+                watermarked_np,
+                caption=f"Watermarked ({psnr_embed:.2f} dB)",
+                width=280
+            )
+
+        st.download_button(
+            "Download Watermarked Image",
+            data=png_bytes_from_array(watermarked_np),
+            file_name="watermarked_image.png",
+            mime="image/png",
+            use_container_width=False,
+        )
+
+# ── extract ───────────────────────────────────────────────────────────────────
+
+if extract_clicked:
+    if st.session_state["watermarked_tensor"] is None:
+        st.warning("Please embed a watermark first.")
+    else:
+        attacked_tensor = apply_selected_attack(
+            st.session_state["watermarked_tensor"].clone(),
+            attack_name,
+        )
+        attacked_np = tensor_to_rgb_np(attacked_tensor)
+
+        key_t = key_to_tensor(extract_key, size=WM_SIZE, device=DEVICE)
+        wrong_key_t = key_to_tensor("wrong_key_probe", size=WM_SIZE, device=DEVICE)
+
+        is_rotation = _is_rotation_attack(attack_name)
+        estimated_angle = 0.0
+
+        if use_rotation_search and is_rotation:
+            logits, wrong_logits, estimated_angle = derotate_and_decode(
+                attacked_tensor, decoder, key_t, wrong_key_t
+            )
+        else:
+            with torch.no_grad():
+                logits = decoder(attacked_tensor, key_t)
+                wrong_logits = decoder(attacked_tensor, wrong_key_t)
+
+        decoded = decode_from_logits(logits, extract_key, use_decrypt=use_decrypt, use_ecc=use_bch)
+        wrong_decoded = decode_from_logits(wrong_logits, "wrong_key_probe",
+                                           use_decrypt=use_decrypt, use_ecc=use_bch)
+
+        final_bits = decoded["final_bits"]
+        raw_bits = decoded["raw_bits"]
+        decrypted_bits = decoded["decrypted_bits"]
+        prob_map = decoded["prob_map"]
+        wrong_final = wrong_decoded["final_bits"]
+
+        final_ber, final_acc = ber_and_accuracy(st.session_state["wm_true"], final_bits)
+        raw_ber, raw_acc = ber_and_accuracy(st.session_state["wm_true"], raw_bits)
+        dec_ber, _ = ber_and_accuracy(st.session_state["wm_true"], decrypted_bits)
+        ncc_val = normalized_correlation(st.session_state["wm_true"], final_bits)
+        wrong_key_sim = float(np.mean(wrong_final == st.session_state["wm_true"]))
+        psnr_val = psnr(
+            st.session_state["host_np"],
+            attacked_np
+        )
+
+        ssim_val = ssim(
+            st.session_state["host_np"],
+            attacked_np
+        )
+
+        # Store for re-rendering graphs without re-running
+        st.session_state["last_results"] = {
+            "attack_name": attack_name,
+            "estimated_angle": estimated_angle,
+            "is_rotation": is_rotation,
+            "psnr_val": psnr_val,
+            "ssim_val": ssim_val,
+            "ncc_val": ncc_val,
+            "final_ber": final_ber,
+            "final_acc": final_acc,
+            "raw_ber": raw_ber,
+            "raw_acc": raw_acc,
+            "dec_ber": dec_ber,
+            "wrong_key_sim": wrong_key_sim,
+            "attacked_np": attacked_np,
+            "final_bits": final_bits,
+            "raw_bits": raw_bits,
+            "decrypted_bits": decrypted_bits,
+            "prob_map": prob_map,
+        }
+
+# ── results display ───────────────────────────────────────────────────────────
+
+res = st.session_state.get("last_results")
+if res is not None:
+    attack_name_r = res["attack_name"]
+    final_ber = res["final_ber"]
+    final_acc = res["final_acc"]
+    raw_ber = res["raw_ber"]
+    dec_ber = res["dec_ber"]
+    ncc_val = res["ncc_val"]
+    psnr_val = res["psnr_val"]
+    ssim_val = res["ssim_val"]
+    wrong_key_sim = res["wrong_key_sim"]
+    attacked_np = res["attacked_np"]
+    final_bits = res["final_bits"]
+    raw_bits = res["raw_bits"]
+    decrypted_bits = res["decrypted_bits"]
+    prob_map = res["prob_map"]
+
+    st.divider()
+    st.subheader("Quality & Robustness Metrics")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("PSNR", f"{psnr_val:.2f} dB", help="Higher is better (>30 dB is imperceptible).")
+    m2.metric("SSIM", f"{ssim_val:.4f}", help="Structural similarity (1 = identical).")
+    m3.metric("NCC", f"{ncc_val:.4f}", help="Normalized cross-correlation of extracted vs original bits.")
+    m4.metric("Final BER", f"{final_ber:.4f}", help="Bit error rate after full pipeline (lower is better).")
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Raw BER", f"{raw_ber:.4f}", help="BER before decryption/ECC.")
+    d2.metric("Decrypted BER", f"{dec_ber:.4f}", help="BER after decryption, before ECC.")
+    d3.metric("Wrong-key sim", f"{wrong_key_sim:.4f}",
+              help="Similarity with wrong key (≈0.5 means no leakage).")
+    d4.metric("Attack", attack_name_r)
+
+    if res["is_rotation"] and res["estimated_angle"] != 0.0:
+        st.info(
+            f"Anti-rotation search estimated the image was rotated by "
+            f"**{res['estimated_angle']:.0f}°** and compensated automatically."
+        )
+
+    # ── Visual comparison ─────────────────────────────────────────────────────
+
+    st.subheader("Visual Comparison")
+    row2 = st.columns(5)
+
+    with row2[0]:
+        st.image(
+            st.session_state["host_np"],
+            caption="Host Image",
+            use_container_width=True
+        )
+
+    with row2[1]:
+        st.image(
+            st.session_state["watermarked_np"],
+            caption="Watermarked",
+            use_container_width=True
+    )
+
+    with row2[2]:
+        st.image(
+            attacked_np,
+            caption=f"Attacked: {attack_name}",
+            use_container_width=True
+        )
+
+    with row2[3]:
+        st.image(
+            (st.session_state["wm_true"] * 255).astype(np.uint8),
+            caption="Original Watermark",
+            use_container_width=True,
+        )
+
+    with row2[4]:
+        st.image(
+            (final_bits * 255).astype(np.uint8),
+            caption="Final Extracted",
+            use_container_width=True
+        )
+
+
+    # # ── Charts for report / PPT ───────────────────────────────────────────────
+
+    # st.divider()
+    # st.subheader("Charts")
+
+    # tab_pipeline, tab_comparison = st.tabs(
+    #     ["Pipeline BER breakdown", "Attack robustness comparison"]
+    # )
+
+    # with tab_pipeline:
+    #     st.markdown(
+    #         "**BER at each decoding stage** — shows how decryption and error-correction "
+    #         "progressively reduce the bit error rate."
+    #     )
+    #     pipeline_df = pd.DataFrame(
+    #         {
+    #             "Stage": ["Raw (after decoder)", "After Decryption", "Final (after ECC)"],
+    #             "BER": [raw_ber, dec_ber, final_ber],
+    #             "Accuracy (%)": [
+    #                 (1 - raw_ber) * 100,
+    #                 (1 - dec_ber) * 100,
+    #                 final_acc * 100,
+    #             ],
+    #         }
+    #     )
+    #     # Bar chart
+    #     st.bar_chart(
+    #         pipeline_df.set_index("Stage")["BER"],
+    #         color="#EF553B",
+    #         use_container_width=True,
+    #     )
+    #     st.dataframe(
+    #         pipeline_df.style.format({"BER": "{:.4f}", "Accuracy (%)": "{:.2f}"}),
+    #         use_container_width=True,
+    #         hide_index=True,
+    #     )
+
+    # with tab_comparison:
+    #     st.markdown(
+    #         "**Per-attack robustness** — run extraction under different attacks "
+    #         "to fill in this comparison chart."
+    #     )
+
+    #     # Accumulate results across runs into session state
+    #     if "attack_history" not in st.session_state:
+    #         st.session_state["attack_history"] = {}
+
+    #     atk_key = attack_name_r if attack_name_r != "None" else "No Attack"
+    #     st.session_state["attack_history"][atk_key] = {
+    #         "Accuracy (%)": final_acc * 100,
+    #         "BER": final_ber,
+    #         "NCC": ncc_val,
+    #     }
+
+    #     hist = st.session_state["attack_history"]
+    #     if hist:
+    #         hist_df = pd.DataFrame(hist).T.reset_index().rename(columns={"index": "Attack"})
+    #         col_chart1, col_chart2 = st.columns(2)
+
+    #         with col_chart1:
+    #             st.markdown("**Accuracy (%) per attack**")
+    #             st.bar_chart(
+    #                 hist_df.set_index("Attack")["Accuracy (%)"],
+    #                 color="#00CC96",
+    #                 use_container_width=True,
+    #             )
+
+    #         with col_chart2:
+    #             st.markdown("**NCC per attack**")
+    #             st.bar_chart(
+    #                 hist_df.set_index("Attack")["NCC"],
+    #                 color="#636EFA",
+    #                 use_container_width=True,
+    #             )
+
+    #         st.dataframe(
+    #             hist_df.style.format({"Accuracy (%)": "{:.2f}", "BER": "{:.4f}", "NCC": "{:.4f}"}),
+    #             use_container_width=True,
+    #             hide_index=True,
+    #         )
+
+    #         if st.button("Clear attack history", use_container_width=False):
+    #             st.session_state["attack_history"] = {}
+    #             st.rerun()
+
+    #     else:
+    #         st.info("Run extraction under different attacks to compare robustness here.")
+
+    # ─────────────────────────────────────────────
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # ── attack history ─────────────────────────
+
+    if "attack_history" not in st.session_state:
+        st.session_state["attack_history"] = {}
+
+    atk_key = attack_name_r if attack_name_r != "None" else "No Attack"
+
+    st.session_state["attack_history"][atk_key] = {
+        "PSNR": psnr_val,
+        "SSIM": ssim_val,
+        "BER": final_ber,
+        "NCC": ncc_val,
+    }
+
+    hist_df = pd.DataFrame(
+        st.session_state["attack_history"]
+    ).T.reset_index()
+
+    hist_df.columns = [
+        "Attack",
+        "PSNR",
+        "SSIM",
+        "BER",
+        "NCC"
+    ]
+
+    # ── HEATMAP ───────────────────────────────
+
+    st.markdown("Attack Robustness Heatmap")
+
+    heatmap_df = hist_df.set_index("Attack")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    sns.heatmap(
+        heatmap_df,
+        annot=True,
+        fmt=".2f",
+        cmap="coolwarm",
+        linewidths=1,
+        cbar=True,
+        ax=ax
+    )
+
+    st.pyplot(fig, use_container_width=True)
+
+    # ── BER GRAPH ─────────────────────────────
+
+    st.markdown("## 📉 BER vs Attack")
+
+    fig2, ax2 = plt.subplots(figsize=(12, 4))
+
+    ax2.plot(
+        hist_df["Attack"],
+        hist_df["BER"],
+        marker="o",
+        linewidth=3
+    )
+
+    ax2.set_xlabel("Attack")
+    ax2.set_ylabel("BER")
+    ax2.set_title("BER vs Attack")
+
+    plt.xticks(rotation=30)
+
+    st.pyplot(fig2, use_container_width=True)
+
+        # ── Download ──────────────────────────────────────────────────────────────
+
+    st.divider()
+    st.download_button(
+        "Download Extracted Watermark (PNG)",
+        data=png_bytes_from_array((final_bits * 255).astype(np.uint8)),
+        file_name="extracted_watermark.png",
+        mime="image/png",
+        use_container_width=True,
+    )
