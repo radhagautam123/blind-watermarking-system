@@ -55,6 +55,11 @@ def ncc_loss_from_logits(logits, target):
     return 1.0 - ncc.mean()
 
 
+def crop_consistency_loss(logits_a, logits_b):
+    """Encourage the decoder to output stable watermark probabilities on cropped views."""
+    return F.l1_loss(torch.sigmoid(logits_a), torch.sigmoid(logits_b))
+
+
 def watermark_loss(pred_wm_logits, true_wm):
     true_wm = true_wm.float()
     bce = bce_logits_loss(pred_wm_logits, true_wm)

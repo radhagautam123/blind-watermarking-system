@@ -187,22 +187,32 @@ def targeted_attack(img, name="jpeg50"):
 
     if name == "jpeg50":
         return _jpeg_attack(img, quality_range=(50, 50))
+    if name == "jpeg70":
+        return _jpeg_attack(img, quality_range=(70, 70))
     if name == "jpeg30":
         return _jpeg_attack(img, quality_range=(30, 30))
     if name == "blur5":
         return _gaussian_blur(img, kernel_size=5, sigma=(0.8, 1.2))
+    if name == "blur7":
+        return _gaussian_blur(img, kernel_size=7, sigma=(1.0, 1.5))
     if name == "rotate10":
         return _rotate(img, angle=10.0)
     if name == "rotate15":
         return _rotate(img, angle=15.0)
+    if name == "crop90":
+        return _crop_and_resize(img, crop_ratio=0.90)
     if name == "crop80":
         return _crop_and_resize(img, crop_ratio=0.80)
     if name == "crop70":
         return _crop_and_resize(img, crop_ratio=0.70)
     if name == "resize70":
         return _resize_attack(img, scale=0.70)
+    if name == "zoom105":
+        return _zoom_attack(img, scale=1.05)
     if name == "zoom120":
         return _zoom_attack(img, scale=1.20)
+    if name == "zoom140":
+        return _zoom_attack(img, scale=1.40)
     if name == "noise003":
         return _gaussian_noise(img, sigma=0.03)
     if name == "noise005":
@@ -213,6 +223,15 @@ def targeted_attack(img, name="jpeg50"):
         return _contrast(img, factor=1.20)
     if name == "brightness":
         return _brightness(img, factor=1.15)
+    if name == "translate5":
+        return _translate(img, max_ratio=0.05)
+
+    if name == "translate10":
+        return _translate(img, max_ratio=0.10)
+
+    if name == "translate15":
+        return _translate(img, max_ratio=0.15)
+
     if name == "translate":
         return _translate(img, max_ratio=0.08)
 

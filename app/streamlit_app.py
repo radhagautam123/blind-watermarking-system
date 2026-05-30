@@ -21,10 +21,14 @@ from models.encoder import EncoderNet
 from models.decoder import DecoderNet
 from models.attack_layer import targeted_attack, random_attack
 from utils.preprocess import load_binary_watermark
+from utils.metrics import ber as ber_metric
+from utils.metrics import compute_ssim as ssim_metric
 from utils.metrics import normalized_correlation
+from utils.metrics import psnr as psnr_metric
 from utils.wm_pipeline import (
     decode_from_logits,
     encode_for_embedding,
+    extract_with_crop_search,
     key_to_tensor,
     prepare_plain_watermark,
     wm_secure_to_tensor,
@@ -103,21 +107,34 @@ KNOWN_CHECKPOINT_NAMES = [
 
 ATTACK_CHOICES = [
     "None",
-    "JPEG 50",
-    "JPEG 30",
-    "Blur",
+
+    "JPEG70",
+    "JPEG50",
+    "JPEG30",
+
+    "Crop10",
+    "Crop20",
+    "Crop30",
+
+    "Translation5",
+    "Translation10",
+    "Translation15",
+
+    "Zoom105",
+    "Zoom120",
+    "Zoom140",
+
+    # Keep all other existing attacks
+    "Blur5",
+    "Blur7",
     "Noise 0.03",
     "Noise 0.05",
     "Rotate 10",
     "Rotate 15",
-    "Crop 80",
-    "Crop 70",
     "Resize 70",
-    "Zoom 120",
     "Brightness",
     "Contrast",
     "Salt & Pepper",
-    "Translate",
     "Random Medium",
     "Random Strong",
 ]
@@ -138,42 +155,16 @@ def tensor_to_rgb_np(t):
 
 
 def psnr(x, y, eps=1e-8):
-    x = x.astype(np.float32) / 255.0
-    y = y.astype(np.float32) / 255.0
-    mse = np.mean((x - y) ** 2)
-    if mse <= eps:
-        return 99.0
-    return 10.0 * np.log10(1.0 / mse)
+    return psnr_metric(x, y)
 
 
 def ssim(img1, img2):
-    img1 = img1.astype(np.float64) / 255.0
-    img2 = img2.astype(np.float64) / 255.0
-
-    if img1.ndim == 3:
-        vals = [ssim(img1[..., c], img2[..., c]) for c in range(img1.shape[2])]
-        return float(np.mean(vals))
-
-    c1 = 0.01 ** 2
-    c2 = 0.03 ** 2
-    mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
-    mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-    sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
-    sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
-    sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
-    num = (2 * mu1_mu2 + c1) * (2 * sigma12 + c2)
-    den = (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
-    return float((num / (den + 1e-8)).mean())
+    return ssim_metric(img1, img2)
 
 
 def ber_and_accuracy(true_wm, pred_wm):
-    true_bits = (true_wm > 0).astype(np.uint8)
-    pred_bits = (pred_wm > 0).astype(np.uint8)
-    ber = np.mean(true_bits != pred_bits)
-    return float(ber), float(1.0 - ber)
+    ber_val = ber_metric(true_wm, pred_wm)
+    return float(ber_val), float(1.0 - ber_val)
 
 
 def prepare_watermark(uploaded_file):
@@ -378,36 +369,115 @@ def load_models(checkpoint_path_str: str):
 
 
 def apply_selected_attack(img_tensor, attack_name):
+
+    if attack_name == "None":
+        return img_tensor
+
+    # JPEG
+    if attack_name == "JPEG70":
+        return targeted_attack(img_tensor, "jpeg70")
+
+    if attack_name == "JPEG50":
+        return targeted_attack(img_tensor, "jpeg50")
+
+    if attack_name == "JPEG30":
+        return targeted_attack(img_tensor, "jpeg30")
+
+    # Crop
+    if attack_name == "Crop10":
+        return targeted_attack(img_tensor, "crop90")
+
+    if attack_name == "Crop20":
+        return targeted_attack(img_tensor, "crop80")
+
+    if attack_name == "Crop30":
+        return targeted_attack(img_tensor, "crop70")
+
+    # Translation
+    if attack_name == "Translation5":
+        return targeted_attack(img_tensor, "translate5")
+
+    if attack_name == "Translation10":
+        return targeted_attack(img_tensor, "translate10")
+
+    if attack_name == "Translation15":
+        return targeted_attack(img_tensor, "translate15")
+
+    # Zoom
+    if attack_name == "Zoom105":
+        return targeted_attack(img_tensor, "zoom105")
+
+    if attack_name == "Zoom120":
+        return targeted_attack(img_tensor, "zoom120")
+
+    if attack_name == "Zoom140":
+        return targeted_attack(img_tensor, "zoom140")
+
     mapping = {
-        "JPEG 50": "jpeg50",
-        "JPEG 30": "jpeg30",
-        "Blur": "blur5",
+        "Blur5": "blur5",
+        "Blur7": "blur7",
         "Noise 0.03": "noise003",
         "Noise 0.05": "noise005",
         "Rotate 10": "rotate10",
         "Rotate 15": "rotate15",
-        "Crop 80": "crop80",
-        "Crop 70": "crop70",
         "Resize 70": "resize70",
-        "Zoom 120": "zoom120",
         "Brightness": "brightness",
         "Contrast": "contrast",
         "Salt & Pepper": "sp002",
-        "Translate": "translate",
     }
-    if attack_name == "None":
-        return img_tensor
-    if attack_name in ("Random Medium", "Random Strong"):
-        strength = "medium" if "Medium" in attack_name else "strong"
-        return random_attack(img_tensor, strength=strength)
+
+    if attack_name == "Random Medium":
+        return random_attack(img_tensor, strength="medium")
+
+    if attack_name == "Random Strong":
+        return random_attack(img_tensor, strength="strong")
+
     key = mapping.get(attack_name)
+
     if key:
         return targeted_attack(img_tensor, key)
+
     return img_tensor
+
+    
 
 
 def _is_rotation_attack(attack_name: str) -> bool:
     return "Rotate" in attack_name or "Random" in attack_name
+
+
+def choose_default_checkpoint() -> Path:
+    """Prefer the best available checkpoint, then latest, then the newest epoch checkpoint."""
+    candidates = []
+
+    preferred_names = [
+        "checkpoint_best.pth",
+        "checkpoint_best_ber.pth",
+        "checkpoint_best_attack_ber.pth",
+        "checkpoint_best_clean_ber.pth",
+        "checkpoint_best_psnr.pth",
+        "checkpoint_latest.pth",
+    ]
+
+    for directory in CHECKPOINT_SEARCH_DIRS:
+        if not directory.exists():
+            continue
+        for name in preferred_names:
+            path = directory / name
+            if path.exists():
+                candidates.append(path)
+
+        epoch_files = sorted(directory.glob("checkpoint_epoch_*.pth"), key=lambda p: p.name)
+        candidates.extend(epoch_files)
+
+    if candidates:
+        # Choose the newest epoch checkpoint if present, otherwise the first preferred one.
+        epoch_candidates = [p for p in candidates if "checkpoint_epoch_" in p.name]
+        if epoch_candidates:
+            return max(epoch_candidates, key=lambda p: int(p.stem.split("_")[-1]))
+        return candidates[0]
+
+    return PROJECT_ROOT / "checkpoints" / "checkpoint_latest.pth"
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -428,8 +498,8 @@ for key, default in {
 with st.sidebar:
     st.header("Controls")
 
-    # Fixed checkpoint
-    selected_ckpt_path = PROJECT_ROOT / "checkpoints" / "checkpoint_epoch_25.pth"
+    # Auto-select the best available checkpoint from the project folders.
+    selected_ckpt_path = choose_default_checkpoint()
 
     # Keys
     st.subheader("Keys")
@@ -482,11 +552,6 @@ except Exception as e:
 # ── title + checkpoint summary ────────────────────────────────────────────────
 
 st.title("Blind Watermarking System")
-st.caption(
-    "Embed an invisible watermark into a host image, apply an attack, "
-    "and extract the watermark — with full quality and robustness metrics."
-)
-
 # ── upload panel ──────────────────────────────────────────────────────────────
 
 col_upload_1, col_upload_2 = st.columns(2)
@@ -524,6 +589,7 @@ if embed_clicked:
         st.session_state["watermarked_np"] = watermarked_np
         st.session_state["host_np"] = host_np
         st.session_state["wm_true"] = wm_true
+        st.session_state["psnr_embed"] = psnr_embed
         st.session_state["last_results"] = None
 
         st.success(f"Watermark embedded — PSNR: {psnr_embed:.2f} dB")
@@ -574,12 +640,22 @@ if extract_clicked:
             logits, wrong_logits, estimated_angle = derotate_and_decode(
                 attacked_tensor, decoder, key_t, wrong_key_t
             )
+            best_candidate = attacked_tensor
         else:
+            best_candidate, logits, decoded, _ = extract_with_crop_search(
+                decoder,
+                attacked_tensor,
+                extract_key,
+                key_t,
+                use_decrypt=use_decrypt,
+                use_ecc=use_bch,
+            )
             with torch.no_grad():
-                logits = decoder(attacked_tensor, key_t)
-                wrong_logits = decoder(attacked_tensor, wrong_key_t)
+                wrong_logits = decoder(best_candidate, wrong_key_t)
+            estimated_angle = 0.0
 
-        decoded = decode_from_logits(logits, extract_key, use_decrypt=use_decrypt, use_ecc=use_bch)
+        if "decoded" not in locals():
+            decoded = decode_from_logits(logits, extract_key, use_decrypt=use_decrypt, use_ecc=use_bch)
         wrong_decoded = decode_from_logits(wrong_logits, "wrong_key_probe",
                                            use_decrypt=use_decrypt, use_ecc=use_bch)
 
@@ -594,15 +670,14 @@ if extract_clicked:
         dec_ber, _ = ber_and_accuracy(st.session_state["wm_true"], decrypted_bits)
         ncc_val = normalized_correlation(st.session_state["wm_true"], final_bits)
         wrong_key_sim = float(np.mean(wrong_final == st.session_state["wm_true"]))
-        psnr_val = psnr(
-            st.session_state["host_np"],
-            attacked_np
-        )
-
-        ssim_val = ssim(
-            st.session_state["host_np"],
-            attacked_np
-        )
+        
+        # For "No Attack", use imperceptibility PSNR from embedding; for other attacks, measure degradation
+        if attack_name == "None":
+            psnr_val = st.session_state.get("psnr_embed", 35.0)
+            ssim_val = ssim_metric(st.session_state["host_np"], st.session_state["watermarked_np"])
+        else:
+            psnr_val = psnr_metric(st.session_state["host_np"], attacked_np)
+            ssim_val = ssim_metric(st.session_state["host_np"], attacked_np)
 
         # Store for re-rendering graphs without re-running
         st.session_state["last_results"] = {

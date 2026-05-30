@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from models.encoder import EncoderNet
 from models.decoder import DecoderNet
-from models.losses import watermark_loss, wrong_key_loss, image_loss, ber_from_logits
+from models.losses import watermark_loss, wrong_key_loss, image_loss, ber_from_logits, crop_consistency_loss
 from models.attack_layer import mixed_attack_batch
 from utils.wm_pipeline import encode_for_embedding, key_to_tensor, decode_from_logits, prepare_plain_watermark
 
@@ -262,7 +262,22 @@ def apply_epoch_attack(x, epoch):
     return mixed_attack_batch(x, epoch=epoch).float()
 
 
-def compute_combined_loss(imgs, watermarked, pred_clean, pred_attacked, wm_target_bits, wrong_pred, weights):
+def make_crop_view(x):
+    """Create a mild center-crop view to regularize the decoder against crop/translation noise."""
+    if x.ndim != 4:
+        return x
+    _, _, h, w = x.shape
+    crop_h = max(64, int(h * random.uniform(0.84, 0.96)))
+    crop_w = max(64, int(w * random.uniform(0.84, 0.96)))
+    top = random.randint(0, max(0, h - crop_h))
+    left = random.randint(0, max(0, w - crop_w))
+    cropped = x[:, :, top:top + crop_h, left:left + crop_w]
+    if cropped.shape[-2:] != (h, w):
+        cropped = F.interpolate(cropped, size=(h, w), mode="bilinear", align_corners=False)
+    return cropped
+
+
+def compute_combined_loss(imgs, watermarked, pred_clean, pred_attacked, wm_target_bits, wrong_pred, weights, crop_pred=None):
     clean_wm_l = watermark_loss(pred_clean, wm_target_bits)
     attacked_wm_l = watermark_loss(pred_attacked, wm_target_bits)
 
@@ -278,12 +293,17 @@ def compute_combined_loss(imgs, watermarked, pred_clean, pred_attacked, wm_targe
     else:
         key_l = wrong_key_loss(wrong_pred)
 
+    crop_l = torch.tensor(0.0, device=imgs.device, dtype=imgs.dtype)
+    if crop_pred is not None:
+        crop_l = crop_consistency_loss(pred_attacked, crop_pred) * 0.10
+
     total = (
         weights["wm"] * wm_l +
         weights["img"] * img_l +
-        weights["key"] * key_l
+        weights["key"] * key_l +
+        0.10 * crop_l
     )
-    return total, wm_l, img_l, key_l
+    return total, wm_l, img_l, key_l, crop_l
 
 
 def get_rng_state():
@@ -363,8 +383,14 @@ def try_resume(path, encoder, decoder, optimizer, scheduler, scaler, early_stopp
 
     checkpoint = _torch_load(path)
 
-    encoder.load_state_dict(checkpoint["encoder"])
-    decoder.load_state_dict(checkpoint["decoder"])
+    enc_info = encoder.load_state_dict(checkpoint["encoder"], strict=False)
+    dec_info = decoder.load_state_dict(checkpoint["decoder"], strict=False)
+    if enc_info.missing_keys or enc_info.unexpected_keys or dec_info.missing_keys or dec_info.unexpected_keys:
+        print("Resume warning: partial key mismatch detected while loading checkpoint.")
+        print("  encoder missing   :", enc_info.missing_keys)
+        print("  encoder unexpected:", enc_info.unexpected_keys)
+        print("  decoder missing   :", dec_info.missing_keys)
+        print("  decoder unexpected:", dec_info.unexpected_keys)
     optimizer.load_state_dict(checkpoint["optimizer"])
 
     if scheduler is not None and checkpoint.get("scheduler") is not None:
@@ -436,22 +462,25 @@ def evaluate(encoder, decoder, loader, epoch):
 
             pred_clean = decoder(watermarked, key_tensor)
             pred_attacked = decoder(attacked, key_tensor)
+            crop_attacked = make_crop_view(attacked)
+            pred_crop = decoder(crop_attacked, key_tensor)
             wrong_pred = decoder(attacked, wrong_key_tensor)
 
-            loss, wm_l, img_l, key_l = compute_combined_loss(
+            loss, wm_l, img_l, key_l, crop_l = compute_combined_loss(
                 imgs=imgs,
                 watermarked=watermarked,
                 pred_clean=pred_clean,
                 pred_attacked=pred_attacked,
                 wm_target_bits=wm_target_bits,
                 wrong_pred=wrong_pred,
-                weights=weights
+                weights=weights,
+                crop_pred=pred_crop,
             )
 
         total_loss_val += loss.item()
         total_wm_loss += wm_l.item()
         total_img_loss += img_l.item()
-        total_key_loss += key_l.item()
+        total_key_loss += key_l.item() + crop_l.item()
         total_psnr += compute_psnr_torch(imgs.float(), watermarked.float())
         total_ber_clean += ber_from_logits(pred_clean.float(), wm_target_bits.float()).item()
         total_ber_attack += ber_from_logits(pred_attacked.float(), wm_target_bits.float()).item()
@@ -531,16 +560,19 @@ for epoch in range(start_epoch, EPOCHS):
 
             pred_clean = decoder(watermarked, key_tensor)
             pred_attacked = decoder(attacked, key_tensor)
+            crop_attacked = make_crop_view(attacked)
+            pred_crop = decoder(crop_attacked, key_tensor)
             wrong_pred = decoder(attacked, wrong_key_tensor)
 
-            loss, wm_l, img_l, key_l = compute_combined_loss(
+            loss, wm_l, img_l, key_l, crop_l = compute_combined_loss(
                 imgs=imgs,
                 watermarked=watermarked,
                 pred_clean=pred_clean,
                 pred_attacked=pred_attacked,
                 wm_target_bits=wm_target_bits,
                 wrong_pred=wrong_pred,
-                weights=weights
+                weights=weights,
+                crop_pred=pred_crop,
             )
 
         if not torch.isfinite(loss):
@@ -560,7 +592,7 @@ for epoch in range(start_epoch, EPOCHS):
         running_loss += loss.item()
         running_wm_loss += wm_l.item()
         running_img_loss += img_l.item()
-        running_key_loss += key_l.item()
+        running_key_loss += key_l.item() + crop_l.item()
         running_psnr += compute_psnr_torch(imgs.float(), watermarked.float())
         running_ber_clean += ber_from_logits(pred_clean.detach().float(), wm_target_bits.float()).item()
         running_ber_attack += ber_from_logits(pred_attacked.detach().float(), wm_target_bits.float()).item()
