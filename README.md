@@ -1,92 +1,124 @@
-# 🔐 Blind Image Watermarking using Deep Learning
+# Deep Learning-Based Secure Blind Image Watermarking
 
-## 📌 Overview
-This project implements a **robust blind image watermarking system** using deep learning.  
-The system embeds a secret watermark into an image and extracts it without needing the original image.
+## Overview
 
-It is designed to be:
-- Imperceptible (high image quality)
-- Robust against attacks (noise, rotation, crop, etc.)
-- Secure using a secret key
+This project implements a secure blind image watermarking framework that embeds and extracts watermarks without requiring the original image during recovery.
 
----
+The system is designed to address three key requirements of practical watermarking systems:
 
-## 🚀 Features
-- Deep learning-based watermark embedding and extraction
-- Blind watermarking (no original image required)
-- Robust against common image attacks
-- Secure watermark encoding using secret key
-- Streamlit UI for real-time testing
+* Imperceptibility: minimal visual distortion after embedding
+* Robustness: reliable extraction under image manipulations and attacks
+* Security: prevention of unauthorized watermark recovery
+
+Unlike conventional watermarking approaches that rely on handcrafted features or transform-domain techniques, this work employs an end-to-end deep learning architecture with key-conditioned watermark recovery and geometric attack handling.
 
 ---
 
-## 🧠 Methodology
+## Architecture
 
-### 🔹 Encoder
-- U-Net based architecture
-- Attention mechanism (Channel + Spatial Attention)
-- Embeds watermark as a residual signal
+### Encoder
 
-### 🔹 Decoder
-- Convolutional network with Spatial Transformer Network (STN)
-- Recovers watermark from attacked images
+An attention-based encoder embeds watermark information into the host image while preserving visual quality.
 
-### 🔹 Security Layer
-- Secret key-based encoding and decoding
-- Wrong key results in random output (~0.5 accuracy)
+Key components:
 
----
+* Convolutional feature extraction
+* Channel attention
+* Spatial attention
+* Residual watermark embedding
 
-## ⚙️ Tech Stack
-- Python
-- PyTorch
-- OpenCV
-- NumPy
-- Streamlit
+### Security Module
 
----
+A SHA-256-derived key tensor is integrated into the embedding and extraction process.
 
-## 📂 Project Structure
-watermark_project/
-│
-├── models/ # Encoder, Decoder, Attention, STN
-├── utils/ # Metrics, attacks, preprocessing
-├── data/ # Images and watermark samples
-├── weights/ # Trained models (not included in repo)
-├── app/ # Streamlit UI
-├── train.py # Training script
-├── test.py # Evaluation script
-└── README.md
+Additional protection is provided through Error Correction Coding (ECC), improving watermark recovery under distortion.
 
+### Decoder
+
+The decoder performs blind watermark extraction without access to the original image.
+
+To improve robustness against geometric transformations, a Spatial Transformer Network (STN) is incorporated before watermark reconstruction.
 
 ---
 
-## 🧪 Results
+## Methodology
 
-### ✔ Clean Image
-- High PSNR (good visual quality)
-- Accurate watermark extraction
+The model is trained end-to-end using attack-aware training.
 
-### ✔ Under Attacks
-| Attack     | Performance |
-|-----------|------------|
-| Noise     | Strong |
-| Blur      | Strong |
-| Resize    | Strong |
-| Rotation  | Moderate |
-| Crop      | Partial recovery |
+During training, watermarked images are subjected to various distortions including:
 
----
+* Gaussian noise
+* JPEG compression
+* Blur
+* Resize
+* Rotation
+* Translation
+* Cropping
 
-## 🔒 Security
-- Correct key → accurate watermark extraction
-- Wrong key → random output (~50% accuracy)
+This enables the decoder to learn robust watermark recovery under realistic conditions.
 
 ---
 
-## ▶️ How to Run
+## Evaluation
 
-### 1. Install dependencies
+### Image Quality
+
+* PSNR (Peak Signal-to-Noise Ratio)
+* SSIM (Structural Similarity Index)
+
+### Watermark Recovery
+
+* NCC (Normalized Cross Correlation)
+* BER (Bit Error Rate)
+
+### Security Validation
+
+Watermark extraction was evaluated using both valid and invalid keys.
+
+| Scenario      | Outcome                            |
+| ------------- | ---------------------------------- |
+| Correct Key   | Successful recovery                |
+| Incorrect Key | Extraction failure / random output |
+
+---
+
+## Key Contributions
+
+* Attention-based blind watermark embedding
+* Key-conditioned watermark extraction
+* SHA-256-based security mechanism
+* Error Correction Coding integration
+* Spatial Transformer Network for geometric robustness
+* Attack-aware training strategy
+* Interactive Streamlit deployment
+
+---
+
+## Results
+
+The framework achieves:
+
+* High visual fidelity of watermarked images
+* Reliable watermark recovery under common signal-processing attacks
+* Improved robustness against geometric distortions
+* Secure extraction through key-based authentication
+
+---
+
+## Running the Project
+
 ```bash
 pip install -r requirements.txt
 
+python train.py
+
+python test.py
+
+streamlit run app.py
+```
+
+---
+
+## Research Context
+
+This work builds upon recent advances in deep learning-based watermarking and addresses limitations in existing methods related to geometric robustness, security, and practical deployment.
