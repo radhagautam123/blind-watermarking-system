@@ -195,10 +195,17 @@ def targeted_attack(img, name="jpeg50"):
         return _gaussian_blur(img, kernel_size=5, sigma=(0.8, 1.2))
     if name == "blur7":
         return _gaussian_blur(img, kernel_size=7, sigma=(1.0, 1.5))
+    if name == "blur9":
+        return _gaussian_blur(img, kernel_size=9, sigma=(1.2, 1.8))
     if name == "rotate10":
         return _rotate(img, angle=10.0)
     if name == "rotate15":
         return _rotate(img, angle=15.0)
+    if name == "rotate2":
+        return _rotate(img, angle=2.0)
+
+    if name == "rotate5":
+        return _rotate(img, angle=5.0)
     if name == "crop90":
         return _crop_and_resize(img, crop_ratio=0.90)
     if name == "crop80":
@@ -217,17 +224,27 @@ def targeted_attack(img, name="jpeg50"):
         return _gaussian_noise(img, sigma=0.03)
     if name == "noise005":
         return _gaussian_noise(img, sigma=0.05)
+    if name == "noise010":
+        return _gaussian_noise(img, sigma=0.10)
     if name == "sp002":
         return _salt_pepper(img, prob=0.02)
+    if name == "sp005":
+        return _salt_pepper(img, prob=0.05)
     if name == "contrast":
         return _contrast(img, factor=1.20)
+    if name == "contrast_strong":
+        return _contrast(img, factor=1.30)
     if name == "brightness":
         return _brightness(img, factor=1.15)
-    if name == "translate5":
-        return _translate(img, max_ratio=0.05)
-
+    if name == "brightness_strong":
+        return _brightness(img, factor=1.30)
+    if name == "resize50":
+        return _resize_attack(img, scale=0.50)
     if name == "translate10":
         return _translate(img, max_ratio=0.10)
+
+    if name == "translate20":
+        return _translate(img, max_ratio=0.20)
 
     if name == "translate15":
         return _translate(img, max_ratio=0.15)
@@ -369,6 +386,8 @@ def mixed_attack_batch(img, epoch=0):
                 y = random.choice([
                     targeted_attack(x, "jpeg30"),
                     targeted_attack(x, "rotate10"),
+                    targeted_attack(x, "rotate2"),
+                    targeted_attack(x, "rotate5"),
                     targeted_attack(x, "crop80"),
                     targeted_attack(x, "resize70"),
                     targeted_attack(x, "zoom120"),
@@ -402,6 +421,8 @@ def attack_suite(img):
         "jpeg50": targeted_attack(img, "jpeg50"),
         "jpeg30": targeted_attack(img, "jpeg30"),
         "blur5": targeted_attack(img, "blur5"),
+        "rotate2": targeted_attack(img, "rotate2"),
+        "rotate5": targeted_attack(img, "rotate5"),
         "rotate10": targeted_attack(img, "rotate10"),
         "rotate15": targeted_attack(img, "rotate15"),
         "resize70": targeted_attack(img, "resize70"),

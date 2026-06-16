@@ -2,15 +2,11 @@
 
 ## Overview
 
-This project implements a secure blind image watermarking framework that embeds and extracts watermarks without requiring the original image during recovery.
+This project implements a secure blind image watermarking framework capable of embedding and extracting watermarks without requiring access to the original image during recovery.
 
-The system is designed to address three key requirements of practical watermarking systems:
+The framework combines attention-based watermark embedding, SHA-256 key-conditioned extraction, Error Correction Coding (ECC), and attack-aware training to improve robustness against geometric and signal-processing distortions while maintaining image quality.
 
-* Imperceptibility: minimal visual distortion after embedding
-* Robustness: reliable extraction under image manipulations and attacks
-* Security: prevention of unauthorized watermark recovery
-
-Unlike conventional watermarking approaches that rely on handcrafted features or transform-domain techniques, this work employs an end-to-end deep learning architecture with key-conditioned watermark recovery and geometric attack handling.
+The system is designed to achieve a balance between image quality, watermark robustness, and extraction security while operating in a fully blind setting.
 
 ---
 
@@ -18,9 +14,9 @@ Unlike conventional watermarking approaches that rely on handcrafted features or
 
 ### Encoder
 
-An attention-based encoder embeds watermark information into the host image while preserving visual quality.
+An attention-based encoder embeds watermark information into the host image while minimizing perceptual distortion.
 
-Key components:
+Components:
 
 * Convolutional feature extraction
 * Channel attention
@@ -29,25 +25,35 @@ Key components:
 
 ### Security Module
 
-A SHA-256-derived key tensor is integrated into the embedding and extraction process.
+The watermarking process is conditioned on a SHA-256-derived key tensor.
 
-Additional protection is provided through Error Correction Coding (ECC), improving watermark recovery under distortion.
+Security features:
+
+* Key-conditioned watermark encoding
+* Error Correction Coding (ECC)
+* Unauthorized extraction prevention
 
 ### Decoder
 
-The decoder performs blind watermark extraction without access to the original image.
+A blind decoder extracts watermarks without access to the original image.
 
-To improve robustness against geometric transformations, a Spatial Transformer Network (STN) is incorporated before watermark reconstruction.
+A Spatial Transformer Network (STN) is incorporated to improve robustness against:
+
+* Rotation
+* Scaling
+* Translation
+* Cropping
 
 ---
 
-## Methodology
+## Training Strategy
 
-The model is trained end-to-end using attack-aware training.
+The model is trained using attack-aware learning.
 
-During training, watermarked images are subjected to various distortions including:
+Training attacks include:
 
 * Gaussian noise
+* Salt-and-pepper noise
 * JPEG compression
 * Blur
 * Resize
@@ -55,11 +61,83 @@ During training, watermarked images are subjected to various distortions includi
 * Translation
 * Cropping
 
-This enables the decoder to learn robust watermark recovery under realistic conditions.
+This enables robust watermark recovery under realistic distortions.
 
 ---
 
-## Evaluation
+## Streamlit Application
+
+The project includes an interactive Streamlit interface for watermark embedding, extraction, attack simulation, and metric visualization.
+
+### User Interface
+
+<p align="center">
+  <img src="assets/ui_dashboard.png" width="1000">
+</p>
+
+Features:
+
+* Host image upload
+* Watermark upload
+* Key-based embedding and extraction
+* Attack simulation
+* Metric visualization
+* Watermark recovery
+
+---
+
+## Results
+
+### Invalid Key Extraction
+
+<p align="center">
+  <img src="assets/invalid_key_extraction.png" width="1000">
+</p>
+
+Watermark extraction fails when an incorrect key is supplied, demonstrating the effectiveness of the key-conditioned security mechanism.
+
+---
+
+## Experimental Results
+
+### Geometric Attack Robustness
+
+| Host Image | Attack         | NCC    | PSNR (Attacked Image) |
+| ---------- | -------------- | ------ | --------------------- |
+| Peppers    | Rotation (2°)  | 1.0000 | 20.78 dB              |
+| Peppers    | Rotation (5°)  | 0.9989 | 16.52 dB              |
+| Peppers    | Rotation (10°) | 0.9799 | 13.86 dB              |
+| Peppers    | Rotation (15°) | 0.9742 | 12.54 dB              |
+| Dog        | Translation    | 0.9988 | 14.71 dB              |
+| Butterfly  | Zoom           | 0.8787 | 13.08 dB              |
+| Mountain   | Cropping       | 0.8687 | 15.72 dB              |
+
+### Signal-Processing Attack Robustness
+
+| Host Image | Attack                 | NCC    | PSNR (Attacked Image) |
+| ---------- | ---------------------- | ------ | --------------------- |
+| Peppers    | Resize                 | 0.9990 | 32.88 dB              |
+| Building   | Blur                   | 0.9980 | 23.30 dB              |
+| Dog        | Contrast Adjustment    | 1.0000 | 24.12 dB              |
+| Butterfly  | Gaussian Noise (0.05%) | 0.9880 | 28.20 dB              |
+| Building   | JPEG Compression       | 0.9600 | 27.50 dB              |
+| Mountain   | Salt & Pepper Noise    | 0.9800 | 21.32 dB              |
+
+### Watermarked Image Quality
+
+| Host Image | PSNR     |
+| ---------- | -------- |
+| Peppers    | 37.0 dB  |
+| Building   | 36.0 dB  |
+| Dog        | 34.2 dB  |
+| Butterfly  | 35.6 dB  |
+| Mountain   | 39.23 dB |
+
+The experimental results demonstrate reliable watermark recovery under both geometric and signal-processing attacks while maintaining high visual quality of the watermarked image.
+
+---
+
+## Evaluation Metrics
 
 ### Image Quality
 
@@ -68,57 +146,33 @@ This enables the decoder to learn robust watermark recovery under realistic cond
 
 ### Watermark Recovery
 
-* NCC (Normalized Cross Correlation)
+* NCC (Normalized Cross-Correlation)
 * BER (Bit Error Rate)
-
-### Security Validation
-
-Watermark extraction was evaluated using both valid and invalid keys.
-
-| Scenario      | Outcome                            |
-| ------------- | ---------------------------------- |
-| Correct Key   | Successful recovery                |
-| Incorrect Key | Extraction failure / random output |
-
----
-
-## Key Contributions
-
-* Attention-based blind watermark embedding
-* Key-conditioned watermark extraction
-* SHA-256-based security mechanism
-* Error Correction Coding integration
-* Spatial Transformer Network for geometric robustness
-* Attack-aware training strategy
-* Interactive Streamlit deployment
-
----
-
-## Results
-
-The framework achieves:
-
-* High visual fidelity of watermarked images
-* Reliable watermark recovery under common signal-processing attacks
-* Improved robustness against geometric distortions
-* Secure extraction through key-based authentication
 
 ---
 
 ## Running the Project
 
+### Install Dependencies
+
 ```bash
 pip install -r requirements.txt
-
-python train.py
-
-python test.py
-
-streamlit run app.py
 ```
 
----
+### Train
 
-## Research Context
+```bash
+python train.py
+```
 
-This work builds upon recent advances in deep learning-based watermarking and addresses limitations in existing methods related to geometric robustness, security, and practical deployment.
+### Evaluate
+
+```bash
+python test.py
+```
+
+### Launch Streamlit Application
+
+```bash
+streamlit run app.py
+```
